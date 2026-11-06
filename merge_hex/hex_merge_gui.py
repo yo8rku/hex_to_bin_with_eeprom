@@ -16,6 +16,8 @@ The output is firmware_combined.hex in the common source folder.
 """
 
 from pathlib import Path
+import queue
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import zlib
@@ -104,7 +106,10 @@ class HexMergeApp:
         self.start2_var = tk.StringVar(value="000800")
         self.end2_var = tk.StringVar(value="00FFFF")
 
+        self.message_queue = queue.Queue()
+        self.merge_running = False
         self._build_ui()
+        self.root.after(100, self._process_queue)
 
     def _build_ui(self):
         main = ttk.Frame(self.root, padding=14)
@@ -172,7 +177,8 @@ class HexMergeApp:
 
         controls = ttk.Frame(main)
         controls.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(0, 10))
-        ttk.Button(controls, text="Merge HEX", command=self.merge).pack(side="left")
+        self.merge_button = ttk.Button(controls, text="Merge HEX", command=self.merge)
+        self.merge_button.pack(side="left")
         ttk.Button(controls, text="Clear log", command=self.clear_log).pack(
             side="left", padx=8
         )
@@ -212,6 +218,10 @@ class HexMergeApp:
         self.log.configure(state="disabled")
 
     def merge(self):
+        """Validate GUI inputs, then run all file processing in a worker thread."""
+        if self.merge_running:
+            return
+
         self.clear_log()
         try:
             path1 = Path(self.file1_var.get()).expanduser()
@@ -232,20 +242,37 @@ class HexMergeApp:
                 raise ValueError(
                     "Each end address must be greater than or equal to its start address."
                 )
+        except Exception as exc:
+            self._write_log("ERROR: {}".format(exc))
+            messagebox.showerror("HEX Merger - Error", str(exc))
+            return
 
-            self._write_log("HEX 1: {}".format(path1))
-            self._write_log("HEX 2: {}".format(path2))
-            self._write_log("HEX 1 range: 0x{:06X} - 0x{:06X}".format(start1, end1))
-            self._write_log("HEX 2 range: 0x{:06X} - 0x{:06X}".format(start2, end2))
+        self.merge_running = True
+        self.merge_button.configure(state="disabled")
+        self._write_log("Starting merge in background...")
+        self._write_log("HEX 1: {}".format(path1))
+        self._write_log("HEX 2: {}".format(path2))
+        self._write_log("HEX 1 range: 0x{:06X} - 0x{:06X}".format(start1, end1))
+        self._write_log("HEX 2 range: 0x{:06X} - 0x{:06X}".format(start2, end2))
 
+        worker = threading.Thread(
+            target=self._merge_worker,
+            args=(path1, path2, start1, end1, start2, end2),
+            daemon=True,
+        )
+        worker.start()
+
+    def _merge_worker(self, path1, path2, start1, end1, start2, end2):
+        """Perform HEX I/O, merge, verification and CRC without touching Tk."""
+        try:
             source1 = IntelHex(str(path1))
             source2 = IntelHex(str(path2))
             merged = IntelHex()
 
             count1 = copy_range(source1, merged, start1, end1, "HEX 1")
             count2 = copy_range(source2, merged, start2, end2, "HEX 2")
-            self._write_log("Copied HEX 1: {} bytes".format(count1))
-            self._write_log("Copied HEX 2: {} bytes".format(count2))
+            self.message_queue.put(("log", "Copied HEX 1: {} bytes".format(count1)))
+            self.message_queue.put(("log", "Copied HEX 2: {} bytes".format(count2)))
 
             fixed_regions = (
                 (source2, DEVICE_ID_RANGE),
@@ -255,13 +282,16 @@ class HexMergeApp:
             for source, region in fixed_regions:
                 start, end, label = region
                 count = copy_range(source, merged, start, end, label)
-                self._write_log("Copied {}: {} bytes".format(label, count))
+                self.message_queue.put(
+                    ("log", "Copied {}: {} bytes".format(label, count))
+                )
 
             output_path = path1.resolve().parent / OUTPUT_NAME
             merged.write_hex_file(str(output_path), byte_count=16)
 
-            self._write_log("")
-            self._write_log("Verifying generated HEX against source files...")
+            self.message_queue.put(
+                ("log", "Verifying generated HEX against source files...")
+            )
             verified1 = verify_range(source1, merged, start1, end1, "HEX 1")
             verified2 = verify_range(source2, merged, start2, end2, "HEX 2")
             verified_device = verify_range(
@@ -277,37 +307,67 @@ class HexMergeApp:
                 SPECIAL_DATA_RANGE[2]
             )
 
-            self._write_log("OK - HEX 1: {} bytes verified".format(verified1))
-            self._write_log("OK - HEX 2: {} bytes verified".format(verified2))
-            self._write_log(
-                "OK - Device ID: {} bytes verified".format(verified_device)
+            self.message_queue.put(
+                ("log", "OK - HEX 1: {} bytes verified".format(verified1))
             )
-            self._write_log(
-                "OK - Configuration Words: {} bytes verified".format(
+            self.message_queue.put(
+                ("log", "OK - HEX 2: {} bytes verified".format(verified2))
+            )
+            self.message_queue.put(
+                ("log", "OK - Device ID: {} bytes verified".format(verified_device))
+            )
+            self.message_queue.put(
+                ("log", "OK - Configuration Words: {} bytes verified".format(
                     verified_config
-                )
+                ))
             )
-            self._write_log(
-                "OK - Special data: {} bytes verified".format(verified_special)
+            self.message_queue.put(
+                ("log", "OK - Special data: {} bytes verified".format(
+                    verified_special
+                ))
             )
 
             raw = output_path.read_bytes()
             crc = zlib.crc32(raw) & 0xFFFFFFFF
-            self._write_log("")
-            self._write_log("MERGE AND VERIFICATION SUCCESSFUL")
-            self._write_log("Output file size: {} bytes".format(len(raw)))
-            self._write_log(
-                "CRC-32 IEEE (raw HEX file bytes): 0x{:08X}".format(crc)
+            self.message_queue.put(("log", ""))
+            self.message_queue.put(("log", "MERGE AND VERIFICATION SUCCESSFUL"))
+            self.message_queue.put(
+                ("log", "Output file size: {} bytes".format(len(raw)))
             )
-            self._write_log("Disk path: {}".format(output_path))
-            messagebox.showinfo(
-                "HEX Merger", "Merge and verification completed successfully."
+            self.message_queue.put(
+                ("log", "CRC-32 IEEE (raw HEX file bytes): 0x{:08X}".format(crc))
             )
-
+            self.message_queue.put(("log", "Disk path: {}".format(output_path)))
+            self.message_queue.put(("done", str(output_path)))
         except Exception as exc:
-            self._write_log("")
-            self._write_log("ERROR: {}".format(exc))
-            messagebox.showerror("HEX Merger - Error", str(exc))
+            self.message_queue.put(("error", str(exc)))
+
+    def _process_queue(self):
+        """Transfer worker messages to Tk widgets from the main GUI thread."""
+        try:
+            while True:
+                kind, payload = self.message_queue.get_nowait()
+                if kind == "log":
+                    self._write_log(payload)
+                elif kind == "done":
+                    self.merge_running = False
+                    self.merge_button.configure(state="normal")
+                    messagebox.showinfo(
+                        "HEX Merger",
+                        "Merge and verification completed successfully.\\n\\n{}".format(
+                            payload
+                        ),
+                    )
+                elif kind == "error":
+                    self.merge_running = False
+                    self.merge_button.configure(state="normal")
+                    self._write_log("")
+                    self._write_log("ERROR: {}".format(payload))
+                    messagebox.showerror("HEX Merger - Error", payload)
+        except queue.Empty:
+            pass
+
+        self.root.after(100, self._process_queue)
 
 
 def main():
