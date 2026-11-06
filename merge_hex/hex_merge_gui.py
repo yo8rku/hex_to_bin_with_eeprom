@@ -50,46 +50,33 @@ def parse_address(value):
 
 
 def copy_range(source, target, start, end, label):
-    """Copy bytes present in source within an inclusive address range."""
+    """Copy bytes using the same address iteration as the original merge script."""
     if start < 0 or end < start:
         raise ValueError("Invalid range for {}: {:06X}-{:06X}".format(label, start, end))
 
     copied = 0
     for address in source.addresses():
         if start <= address <= end:
-            value = source[address]
-            if address in target and target[address] != value:
-                raise ValueError(
-                    "Address conflict at 0x{:06X} while copying {} "
-                    "(existing 0x{:02X}, new 0x{:02X}).".format(
-                        address, label, target[address], value
-                    )
-                )
-            target[address] = value
+            target[address] = source[address]
             copied += 1
     return copied
 
 
-def verify_range(source, merged, start, end, label):
-    """Compare every source byte in an inclusive range with the merged HEX."""
-    checked = 0
-    for address in source.addresses():
+def verify_range(source, target, start, end, label):
+    """Verify using the original verify_hex.py algorithm (source._buf.items())."""
+    count = 0
+    for address, value in source._buf.items():
         if start <= address <= end:
-            if address not in merged:
+            if target._buf.get(address) != value:
                 raise ValueError(
-                    "Verification failed for {}: address 0x{:06X} is missing.".format(
-                        label, address
+                    "DIFERENTA: 0x{:08X} ({}) - source=0x{:02X}, target={}".format(
+                        address, label, value,
+                        "MISSING" if address not in target._buf
+                        else "0x{:02X}".format(target._buf[address])
                     )
                 )
-            if merged[address] != source[address]:
-                raise ValueError(
-                    "Verification failed for {} at 0x{:06X}: "
-                    "source=0x{:02X}, merged=0x{:02X}.".format(
-                        label, address, source[address], merged[address]
-                    )
-                )
-            checked += 1
-    return checked
+            count += 1
+    return count
 
 
 class HexMergeApp:
@@ -263,81 +250,106 @@ class HexMergeApp:
         worker.start()
 
     def _merge_worker(self, path1, path2, start1, end1, start2, end2):
-        """Perform HEX I/O, merge, verification and CRC without touching Tk."""
+        """Run the original merge sequence and verify the HEX written to disk."""
+        def log(message):
+            self.message_queue.put(("log", message))
+
         try:
-            source1 = IntelHex(str(path1))
-            source2 = IntelHex(str(path2))
-            merged = IntelHex()
+            log("1 - Citire bootloader...")
+            boot = IntelHex(str(path1))
+            log("2 - Bootloader citit: {} bytes adresati".format(len(boot.addresses())))
 
-            count1 = copy_range(source1, merged, start1, end1, "HEX 1")
-            count2 = copy_range(source2, merged, start2, end2, "HEX 2")
-            self.message_queue.put(("log", "Copied HEX 1: {} bytes".format(count1)))
-            self.message_queue.put(("log", "Copied HEX 2: {} bytes".format(count2)))
+            log("3 - Citire aplicatie...")
+            app = IntelHex(str(path2))
+            log("4 - Aplicatie citita: {} bytes adresati".format(len(app.addresses())))
 
-            fixed_regions = (
-                (source2, DEVICE_ID_RANGE),
-                (source1, CONFIG_RANGE),
-                (source2, SPECIAL_DATA_RANGE),
-            )
-            for source, region in fixed_regions:
-                start, end, label = region
-                count = copy_range(source, merged, start, end, label)
-                self.message_queue.put(
-                    ("log", "Copied {}: {} bytes".format(label, count))
-                )
+            log("5 - Creare imagine HEX noua...")
+            result = IntelHex()
+            log("6 - Imagine noua creata")
 
-            output_path = path1.resolve().parent / OUTPUT_NAME
-            merged.write_hex_file(str(output_path), byte_count=16)
+            log("7 - Copiere bootloader (HEX 1)...")
+            count_boot = copy_range(boot, result, start1, end1, "HEX 1")
+            log("8 - Bootloader copiat: {} bytes".format(count_boot))
 
-            self.message_queue.put(
-                ("log", "Verifying generated HEX against source files...")
-            )
-            verified1 = verify_range(source1, merged, start1, end1, "HEX 1")
-            verified2 = verify_range(source2, merged, start2, end2, "HEX 2")
-            verified_device = verify_range(
-                source2, merged, DEVICE_ID_RANGE[0], DEVICE_ID_RANGE[1],
+            log("9 - Copiere aplicatie (HEX 2)...")
+            count_app = copy_range(app, result, start2, end2, "HEX 2")
+            log("10 - Aplicatie copiata: {} bytes".format(count_app))
+
+            log("11 - Copiere Device ID din HEX 2...")
+            count_device = copy_range(
+                app, result, DEVICE_ID_RANGE[0], DEVICE_ID_RANGE[1],
                 DEVICE_ID_RANGE[2]
             )
-            verified_config = verify_range(
-                source1, merged, CONFIG_RANGE[0], CONFIG_RANGE[1],
+            log("12 - Device ID copiat: {} bytes".format(count_device))
+
+            log("13 - Copiere Configuration Words din HEX 1...")
+            count_config = copy_range(
+                boot, result, CONFIG_RANGE[0], CONFIG_RANGE[1],
                 CONFIG_RANGE[2]
             )
-            verified_special = verify_range(
-                source2, merged, SPECIAL_DATA_RANGE[0], SPECIAL_DATA_RANGE[1],
+            log("14 - Configuration Words copiate: {} bytes".format(count_config))
+
+            log("15 - Copiere date speciale / EEPROM din HEX 2...")
+            count_special = copy_range(
+                app, result, SPECIAL_DATA_RANGE[0], SPECIAL_DATA_RANGE[1],
                 SPECIAL_DATA_RANGE[2]
             )
+            log("16 - Date speciale copiate: {} bytes".format(count_special))
 
-            self.message_queue.put(
-                ("log", "OK - HEX 1: {} bytes verified".format(verified1))
+            output_path = path1.resolve().parent / OUTPUT_NAME
+            log("17 - Salvare HEX: {}".format(output_path))
+            result.write_hex_file(str(output_path), byte_count=16)
+            log("18 - HEX salvat")
+
+            log("19 - Recitire HEX final de pe disc pentru verificare...")
+            final = IntelHex(str(output_path))
+            log("20 - HEX final recitit")
+
+            log("21 - Verificare bootloader...")
+            verified_boot = verify_range(
+                boot, final, start1, end1, "Bootloader"
             )
-            self.message_queue.put(
-                ("log", "OK - HEX 2: {} bytes verified".format(verified2))
+            log("OK: {} bytes verificati".format(verified_boot))
+
+            log("22 - Verificare aplicatie...")
+            verified_app = verify_range(
+                app, final, start2, end2, "Aplicatie"
             )
-            self.message_queue.put(
-                ("log", "OK - Device ID: {} bytes verified".format(verified_device))
+            log("OK: {} bytes verificati".format(verified_app))
+
+            log("23 - Verificare Device ID...")
+            verified_device = verify_range(
+                app, final, DEVICE_ID_RANGE[0], DEVICE_ID_RANGE[1], "Device ID"
             )
-            self.message_queue.put(
-                ("log", "OK - Configuration Words: {} bytes verified".format(
-                    verified_config
-                ))
+            log("OK: {} bytes verificati".format(verified_device))
+
+            log("24 - Verificare Configuration Words...")
+            verified_config = verify_range(
+                boot, final, CONFIG_RANGE[0], CONFIG_RANGE[1],
+                "Configuration Words"
             )
-            self.message_queue.put(
-                ("log", "OK - Special data: {} bytes verified".format(
-                    verified_special
-                ))
+            log("OK: {} bytes verificati".format(verified_config))
+
+            log("25 - Verificare date speciale / EEPROM...")
+            verified_special = verify_range(
+                app, final, SPECIAL_DATA_RANGE[0], SPECIAL_DATA_RANGE[1],
+                "Date speciale"
             )
+            log("OK: {} bytes verificati".format(verified_special))
 
             raw = output_path.read_bytes()
             crc = zlib.crc32(raw) & 0xFFFFFFFF
-            self.message_queue.put(("log", ""))
-            self.message_queue.put(("log", "MERGE AND VERIFICATION SUCCESSFUL"))
-            self.message_queue.put(
-                ("log", "Output file size: {} bytes".format(len(raw)))
-            )
-            self.message_queue.put(
-                ("log", "CRC-32 IEEE (raw HEX file bytes): 0x{:08X}".format(crc))
-            )
-            self.message_queue.put(("log", "Disk path: {}".format(output_path)))
+            log("")
+            log("==========================")
+            log("VERIFICARE COMPLETA: SUCCES")
+            log("Bootloader: {} bytes".format(verified_boot))
+            log("Aplicatie: {} bytes".format(verified_app))
+            log("Device ID: {} bytes".format(verified_device))
+            log("Configuration Words: {} bytes".format(verified_config))
+            log("Date speciale: {} bytes".format(verified_special))
+            log("Output file size: {} bytes".format(len(raw)))
+            log("CRC-32 IEEE (raw HEX file bytes): 0x{:08X}".format(crc))
+            log("Disk path: {}".format(output_path))
             self.message_queue.put(("done", str(output_path)))
         except Exception as exc:
             self.message_queue.put(("error", str(exc)))
