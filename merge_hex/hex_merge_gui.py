@@ -354,7 +354,7 @@ class HexMergeApp:
                     self.merge_button.configure(state="normal")
                     messagebox.showinfo(
                         "HEX Merger",
-                        "Merge and verification completed successfully.\\n\\n{}".format(
+                        "Merge and verification completed successfully.\n\n{}".format(
                             payload
                         ),
                     )
