@@ -258,7 +258,7 @@ class HexMergeApp:
                 self._write_log("Copied {}: {} bytes".format(label, count))
 
             output_path = path1.resolve().parent / OUTPUT_NAME
-            merged.write_hex_file(str(output_path), byte_count=16, eolstyle="\\r\\n")
+            merged.write_hex_file(str(output_path), byte_count=16)
 
             self._write_log("")
             self._write_log("Verifying generated HEX against source files...")
